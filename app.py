@@ -32,6 +32,11 @@ CHAPTER_PATTERN = re.compile(
 )
 
 
+def is_chapter_title(raw_line: str) -> bool:
+    title = raw_line.strip()
+    return bool(title and len(title) <= 40 and CHAPTER_PATTERN.match(title))
+
+
 class NovelOverlayApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -291,7 +296,22 @@ class NovelOverlayApp:
         page_start_raw_line = 1
         current_page_raw_lines: set[int] = set()
 
+        def flush_page(next_start_raw_line: int) -> None:
+            nonlocal current_lines, page_start_raw_line, current_page_raw_lines
+            if not current_lines:
+                page_start_raw_line = next_start_raw_line
+                return
+            end_raw_line = max(current_page_raw_lines) if current_page_raw_lines else page_start_raw_line
+            pages.append("\n".join(current_lines))
+            raw_line_ranges.append((page_start_raw_line, end_raw_line))
+            current_lines = []
+            current_page_raw_lines = set()
+            page_start_raw_line = next_start_raw_line
+
         for raw_line_no, raw_line in enumerate(self.loaded_text.splitlines(), start=1):
+            if is_chapter_title(raw_line) and current_lines:
+                flush_page(raw_line_no)
+
             wrapped_lines = textwrap.wrap(
                 raw_line,
                 width=chars_per_line,
@@ -303,20 +323,16 @@ class NovelOverlayApp:
             if not wrapped_lines:
                 wrapped_lines = [""]
 
-            for line in wrapped_lines:
+            for wrapped_index, line in enumerate(wrapped_lines):
                 current_lines.append(line)
                 current_page_raw_lines.add(raw_line_no)
                 if len(current_lines) >= lines_per_page:
-                    pages.append("\n".join(current_lines))
-                    raw_line_ranges.append((page_start_raw_line, raw_line_no))
-                    current_lines = []
-                    page_start_raw_line = raw_line_no
-                    current_page_raw_lines = set()
+                    has_more_wrapped_lines = wrapped_index < len(wrapped_lines) - 1
+                    next_start_raw_line = raw_line_no if has_more_wrapped_lines else raw_line_no + 1
+                    flush_page(next_start_raw_line)
 
         if current_lines:
-            pages.append("\n".join(current_lines))
-            end_raw_line = max(current_page_raw_lines) if current_page_raw_lines else page_start_raw_line
-            raw_line_ranges.append((page_start_raw_line, end_raw_line))
+            flush_page(page_start_raw_line)
 
         if not pages:
             pages = [""]
@@ -343,9 +359,8 @@ class NovelOverlayApp:
     def extract_chapters(self, content: str) -> list[tuple[str, int]]:
         chapters: list[tuple[str, int]] = []
         for line_no, raw_line in enumerate(content.splitlines(), start=1):
-            title = raw_line.strip()
-            if title and len(title) <= 40 and CHAPTER_PATTERN.match(title):
-                chapters.append((title, line_no))
+            if is_chapter_title(raw_line):
+                chapters.append((raw_line.strip(), line_no))
         return chapters
 
     def update_current_book_progress(self) -> None:
@@ -638,11 +653,7 @@ class NovelOverlayApp:
             if not selection:
                 return
             _title, line_no = visible_chapters[selection[0]]
-            target_page = 0
-            for page_no, (start_line, end_line) in enumerate(self.page_raw_line_ranges):
-                if start_line <= line_no <= end_line:
-                    target_page = page_no
-                    break
+            target_page = self.find_page_for_raw_line(line_no)
             self.show_page(target_page)
             self.schedule_state_save()
             self.close_child_window(dialog)
@@ -652,6 +663,15 @@ class NovelOverlayApp:
         tk.Button(dialog, text="跳转", command=jump_selected).pack(pady=(0, 10))
         listbox.bind("<Double-Button-1>", lambda _event: jump_selected())
         search_entry.focus_set()
+
+    def find_page_for_raw_line(self, line_no: int) -> int:
+        for page_no, (start_line, _end_line) in enumerate(self.page_raw_line_ranges):
+            if start_line == line_no:
+                return page_no
+        for page_no, (start_line, end_line) in enumerate(self.page_raw_line_ranges):
+            if start_line <= line_no <= end_line:
+                return page_no
+        return 0
 
     def register_child_window(self, window: tk.Toplevel) -> None:
         self.child_windows.append(window)
