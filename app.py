@@ -20,6 +20,7 @@ DEFAULT_FONT_SIZE = 10
 SHOW_HOTKEY = "<ctrl>+<alt>+<space>"
 TEXT_COLOR = "#C8C8C8"
 DRAG_THRESHOLD = 3
+LINE_START_PUNCTUATION = "，。！？；：、,.!?;:)]）】》」』”’…"
 
 CHAPTER_PATTERN = re.compile(
     r"^\s*(?:"
@@ -35,6 +36,29 @@ CHAPTER_PATTERN = re.compile(
 def is_chapter_title(raw_line: str) -> bool:
     title = raw_line.strip()
     return bool(title and len(title) <= 40 and CHAPTER_PATTERN.match(title))
+
+
+def wrap_display_line(raw_line: str, width: int) -> list[str]:
+    wrapped_lines = textwrap.wrap(
+        raw_line,
+        width=width,
+        break_long_words=True,
+        break_on_hyphens=False,
+        replace_whitespace=False,
+        drop_whitespace=False,
+    )
+    if not wrapped_lines:
+        return [""]
+
+    normalized_lines: list[str] = []
+    for line in wrapped_lines:
+        while normalized_lines and line and line[0] in LINE_START_PUNCTUATION:
+            normalized_lines[-1] += line[0]
+            line = line[1:]
+        if line:
+            normalized_lines.append(line)
+
+    return normalized_lines or [""]
 
 
 class NovelOverlayApp:
@@ -312,16 +336,7 @@ class NovelOverlayApp:
             if is_chapter_title(raw_line) and current_lines:
                 flush_page(raw_line_no)
 
-            wrapped_lines = textwrap.wrap(
-                raw_line,
-                width=chars_per_line,
-                break_long_words=True,
-                break_on_hyphens=False,
-                replace_whitespace=False,
-                drop_whitespace=False,
-            )
-            if not wrapped_lines:
-                wrapped_lines = [""]
+            wrapped_lines = wrap_display_line(raw_line, chars_per_line)
 
             for wrapped_index, line in enumerate(wrapped_lines):
                 current_lines.append(line)
@@ -353,6 +368,10 @@ class NovelOverlayApp:
         self.text_widget.configure(state="disabled")
 
     def restore_progress(self, entry: dict) -> None:
+        page_start = entry.get("page_start")
+        if isinstance(page_start, int):
+            self.show_page(self.find_page_for_raw_line(page_start))
+            return
         page = int(entry.get("page", 0))
         self.show_page(page)
 
@@ -368,7 +387,7 @@ class NovelOverlayApp:
             return
         entry = self.ensure_book_entry(self.file_path)
         entry["page"] = self.current_page
-        entry.pop("page_start", None)
+        entry["page_start"] = self.current_page_start_line()
         entry.pop("page_preview", None)
         entry.pop("progress", None)
         self.state["last_book"] = str(self.file_path)
@@ -454,9 +473,9 @@ class NovelOverlayApp:
             int(self.text_font.cget("size")),
         )
         if current_signature != self.last_layout_signature and self.loaded_text:
-            previous_page = self.current_page
+            previous_line = self.current_page_start_line()
             self.repaginate_content()
-            self.show_page(previous_page)
+            self.show_page(self.find_page_for_raw_line(previous_line))
         self.schedule_state_save()
 
     def adjust_font(self, delta: int) -> None:
@@ -466,9 +485,9 @@ class NovelOverlayApp:
             return
         self.text_font.configure(size=new_size)
         if self.loaded_text:
-            previous_page = self.current_page
+            previous_line = self.current_page_start_line()
             self.repaginate_content()
-            self.show_page(previous_page)
+            self.show_page(self.find_page_for_raw_line(previous_line))
         self.schedule_state_save()
 
     def install_global_listeners(self) -> None:
@@ -672,6 +691,12 @@ class NovelOverlayApp:
             if start_line <= line_no <= end_line:
                 return page_no
         return 0
+
+    def current_page_start_line(self) -> int:
+        if not self.page_raw_line_ranges:
+            return 1
+        page_index = min(max(self.current_page, 0), len(self.page_raw_line_ranges) - 1)
+        return self.page_raw_line_ranges[page_index][0]
 
     def register_child_window(self, window: tk.Toplevel) -> None:
         self.child_windows.append(window)
