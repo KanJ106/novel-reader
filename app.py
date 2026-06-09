@@ -21,6 +21,14 @@ SHOW_HOTKEY = "<ctrl>+<alt>+<space>"
 TEXT_COLOR = "#C8C8C8"
 DRAG_THRESHOLD = 3
 LINE_START_PUNCTUATION = "，。！？；：、,.!?;:)]）】》」』”’…"
+WINDOW_BG = "#1e1e1e"
+BORDER_COLOR = "#2a2a2a"
+BORDER_WIDTH = 1
+TEXT_PAD_X = 10
+TEXT_PAD_Y = 8
+TEXT_SPACING_TOP = 1
+TEXT_SPACING_BOTTOM = 3
+PAGE_BOTTOM_GUARD_LINES = 1
 
 CHAPTER_PATTERN = re.compile(
     r"^\s*(?:"
@@ -68,7 +76,7 @@ class NovelOverlayApp:
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", 0.92)
-        self.root.configure(bg="#1e1e1e")
+        self.root.configure(bg=BORDER_COLOR)
 
         self.state = self.load_state()
         self.file_path: Path | None = None
@@ -101,23 +109,25 @@ class NovelOverlayApp:
             family="Microsoft YaHei UI",
             size=int(self.state.get("font_size", DEFAULT_FONT_SIZE)),
         )
+        self.window_frame = tk.Frame(self.root, bg=BORDER_COLOR)
+        self.window_frame.pack(fill="both", expand=True)
         self.text_widget = tk.Text(
-            self.root,
+            self.window_frame,
             wrap="none",
-            bg="#1e1e1e",
+            bg=WINDOW_BG,
             fg=TEXT_COLOR,
-            insertbackground="#1e1e1e",
+            insertbackground=WINDOW_BG,
             relief="flat",
             borderwidth=0,
             highlightthickness=0,
-            padx=9,
-            pady=7,
+            padx=TEXT_PAD_X,
+            pady=TEXT_PAD_Y,
             font=self.text_font,
             cursor="arrow",
-            spacing1=1,
-            spacing3=3,
+            spacing1=TEXT_SPACING_TOP,
+            spacing3=TEXT_SPACING_BOTTOM,
         )
-        self.text_widget.pack(fill="both", expand=True)
+        self.text_widget.pack(fill="both", expand=True, padx=BORDER_WIDTH, pady=BORDER_WIDTH)
 
         self.menu = tk.Menu(self.root, tearoff=0)
         self.menu.add_command(label="移动窗口", command=lambda: self.run_menu_command(self.enable_move_mode))
@@ -138,7 +148,7 @@ class NovelOverlayApp:
         self.restore_last_book_or_prompt()
 
     def bind_events(self) -> None:
-        for widget in (self.root, self.text_widget):
+        for widget in (self.root, self.window_frame, self.text_widget):
             widget.bind("<space>", self.hide_window)
             widget.bind("<MouseWheel>", self.handle_mousewheel)
             widget.bind("<Button-4>", self.handle_mousewheel)
@@ -308,11 +318,11 @@ class NovelOverlayApp:
             self.text_font.measure("00") // 2,
             1,
         )
-        line_height = max(self.text_font.metrics("linespace") + 4, 1)
-        content_width = max(width - 28, 120)
-        content_height = max(height - 22, 60)
+        line_height = max(self.text_font.metrics("linespace") + TEXT_SPACING_TOP + TEXT_SPACING_BOTTOM, 1)
+        content_width = max(width - (TEXT_PAD_X * 2), 120)
+        content_height = max(height - (TEXT_PAD_Y * 2), 60)
         chars_per_line = max((content_width // char_width) - 1, 6)
-        lines_per_page = max((content_height // line_height) - 1, 3)
+        lines_per_page = max((content_height // line_height) - PAGE_BOTTOM_GUARD_LINES, 3)
 
         pages: list[str] = []
         raw_line_ranges: list[tuple[int, int]] = []
