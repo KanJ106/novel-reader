@@ -1,9 +1,12 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-python app.py
-if errorlevel 1 (
-    echo.
-    echo 启动失败，请确认本机已安装 Python 3。
-    pause
-)
+python "%~dp0app.py"
+if errorlevel 1 goto startup_failed
+exit /b 0
+
+:startup_failed
+echo.
+echo Novel Reader failed to start. See the error message above.
+pause
+exit /b 1

@@ -1,8 +1,11 @@
 import json
+import ctypes
+from ctypes import wintypes
 import queue
 import re
-import textwrap
 import time
+from bisect import bisect_right
+from functools import lru_cache
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, font, messagebox
@@ -11,6 +14,8 @@ from pynput import keyboard, mouse
 
 
 APP_DIR = Path(__file__).resolve().parent
+if APP_DIR.name == "__pycache__":
+    APP_DIR = APP_DIR.parent
 STATE_FILE = APP_DIR / "reader_state.json"
 
 DEFAULT_WIDTH = 300
@@ -25,10 +30,9 @@ WINDOW_BG = "#1e1e1e"
 BORDER_COLOR = "#2a2a2a"
 BORDER_WIDTH = 1
 TEXT_PAD_X = 10
-TEXT_PAD_Y = 8
+TEXT_PAD_Y = 4
 TEXT_SPACING_TOP = 1
 TEXT_SPACING_BOTTOM = 3
-PAGE_BOTTOM_GUARD_LINES = 1
 
 CHAPTER_PATTERN = re.compile(
     r"^\s*(?:"
@@ -46,27 +50,42 @@ def is_chapter_title(raw_line: str) -> bool:
     return bool(title and len(title) <= 40 and CHAPTER_PATTERN.match(title))
 
 
-def wrap_display_line(raw_line: str, width: int) -> list[str]:
-    wrapped_lines = textwrap.wrap(
-        raw_line,
-        width=width,
-        break_long_words=True,
-        break_on_hyphens=False,
-        replace_whitespace=False,
-        drop_whitespace=False,
-    )
-    if not wrapped_lines:
-        return [""]
+def convert_screen_point(window: tk.Misc, x: int, y: int, *, to_physical: bool) -> tuple[int, int]:
+    if window.tk.call("tk", "windowingsystem") != "win32":
+        return x, y
+    user32 = ctypes.windll.user32
+    get_ancestor = user32.GetAncestor
+    get_ancestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    get_ancestor.restype = wintypes.HWND
+    hwnd = get_ancestor(window.winfo_id(), 2)
+    convert = (user32.LogicalToPhysicalPointForPerMonitorDPI if to_physical
+               else user32.PhysicalToLogicalPointForPerMonitorDPI)
+    convert.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+    convert.restype = wintypes.BOOL
+    point = wintypes.POINT(x, y)
+    if not convert(hwnd, ctypes.byref(point)):
+        raise ctypes.WinError()
+    return point.x, point.y
 
-    normalized_lines: list[str] = []
-    for line in wrapped_lines:
-        while normalized_lines and line and line[0] in LINE_START_PUNCTUATION:
-            normalized_lines[-1] += line[0]
-            line = line[1:]
-        if line:
-            normalized_lines.append(line)
 
-    return normalized_lines or [""]
+def wrap_display_line(raw_line: str, width: int, measure) -> list[str]:
+    lines = []
+    start = 0
+    while start < len(raw_line):
+        end = start
+        used = 0
+        while end < len(raw_line):
+            size = measure(raw_line[end])
+            if end > start and used + size > width:
+                break
+            used += size
+            end += 1
+        # Keep punctuation with its preceding character without overflowing.
+        if end < len(raw_line) and raw_line[end] in LINE_START_PUNCTUATION and end - start > 1:
+            end -= 1
+        lines.append(raw_line[start:end])
+        start = end
+    return lines or [""]
 
 
 class NovelOverlayApp:
@@ -84,11 +103,15 @@ class NovelOverlayApp:
         self.chapter_marks: list[tuple[str, int]] = []
         self.pages: list[str] = []
         self.page_raw_line_ranges: list[tuple[int, int]] = []
+        self.page_source_offsets: list[int] = []
         self.current_page = 0
         self.visible = True
         self.closed = False
         self.reading_mode = False
         self.context_menu_active = False
+        self.reader_bounds: tuple[int, int, int, int] | None = None
+        self.right_click_captured: tuple[int, int] | None = None
+        self.ignore_clicks_before = 0.0
         self.last_show_time = 0.0
         self.drag_origin_x = 0
         self.drag_origin_y = 0
@@ -98,6 +121,7 @@ class NovelOverlayApp:
         self.move_mode = False
         self.child_windows: list[tk.Toplevel] = []
         self.hotkey_listener = None
+        self.keyboard_listener = None
         self.mouse_listener = None
         self.save_after_id: str | None = None
         self.last_layout_signature: tuple[int, int, int] | None = None
@@ -128,6 +152,8 @@ class NovelOverlayApp:
             spacing3=TEXT_SPACING_BOTTOM,
         )
         self.text_widget.pack(fill="both", expand=True, padx=BORDER_WIDTH, pady=BORDER_WIDTH)
+        self.transparent_background = tk.BooleanVar(value=self.state.get("transparent_background", True))
+        self.apply_background()
 
         self.menu = tk.Menu(self.root, tearoff=0)
         self.menu.add_command(label="移动窗口", command=lambda: self.run_menu_command(self.enable_move_mode))
@@ -138,6 +164,8 @@ class NovelOverlayApp:
         self.menu.add_command(label="字体缩小  Ctrl+-", command=lambda: self.run_menu_command(lambda: self.adjust_font(-1)))
         self.menu.add_command(label="字体放大  Ctrl+=", command=lambda: self.run_menu_command(lambda: self.adjust_font(1)))
         self.menu.add_separator()
+        self.menu.add_checkbutton(label="全透明背景", variable=self.transparent_background,
+                                  command=lambda: self.run_menu_command(self.apply_background))
         self.menu.add_command(label="退出  Esc", command=lambda: self.run_menu_command(self.on_close))
 
         self.bind_events()
@@ -163,16 +191,18 @@ class NovelOverlayApp:
             widget.bind("<Control-t>", lambda _event: self.open_chapter_selector())
             widget.bind("<Control-minus>", lambda _event: self.adjust_font(-1))
             widget.bind("<Control-equal>", lambda _event: self.adjust_font(1))
-            widget.bind("<Left>", lambda _event: self.previous_page())
-            widget.bind("<Right>", lambda _event: self.next_page())
+            widget.bind("<Left>", lambda _event: self.handle_direction_key("left", "local"))
+            widget.bind("<Right>", lambda _event: self.handle_direction_key("right", "local"))
             widget.bind("<Configure>", self.handle_configure)
 
     def load_state(self) -> dict:
         default_state = {"books": [], "last_book": None, "window": {}, "font_size": DEFAULT_FONT_SIZE}
-        if not STATE_FILE.exists():
+        candidates = [path for path in (STATE_FILE, APP_DIR / "__pycache__" / "reader_state.json") if path.exists()]
+        if not candidates:
             return default_state
         try:
-            loaded = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            state_file = max(candidates, key=lambda path: path.stat().st_mtime)
+            loaded = json.loads(state_file.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return default_state
         if not isinstance(loaded, dict):
@@ -182,7 +212,18 @@ class NovelOverlayApp:
             "last_book": loaded.get("last_book"),
             "window": loaded.get("window", {}),
             "font_size": loaded.get("font_size", DEFAULT_FONT_SIZE),
+            "transparent_background": loaded.get("transparent_background", True),
         }
+
+    def apply_background(self) -> None:
+        transparent = self.transparent_background.get()
+        if self.root.tk.call("tk", "windowingsystem") == "win32":
+            self.root.attributes("-transparentcolor", WINDOW_BG if transparent else "")
+        self.root.attributes("-alpha", 1.0)
+        self.root.configure(bg=WINDOW_BG if transparent else BORDER_COLOR)
+        self.window_frame.configure(bg=WINDOW_BG if transparent else BORDER_COLOR)
+        self.state["transparent_background"] = transparent
+        self.schedule_state_save()
 
     def save_state(self) -> None:
         try:
@@ -307,25 +348,20 @@ class NovelOverlayApp:
 
     def repaginate_content(self) -> None:
         self.root.update_idletasks()
-        width = max(self.text_widget.winfo_width(), DEFAULT_WIDTH)
-        height = max(self.text_widget.winfo_height(), DEFAULT_HEIGHT)
+        width = self.text_widget.winfo_width()
+        height = self.text_widget.winfo_height()
         font_size = int(self.text_font.cget("size"))
         self.last_layout_signature = (width, height, font_size)
 
-        char_width = max(
-            self.text_font.measure("WW") // 2,
-            self.text_font.measure("MM") // 2,
-            self.text_font.measure("00") // 2,
-            1,
-        )
+        measure = lru_cache(maxsize=None)(lambda char: self.text_font.measure(char.expandtabs(4)))
         line_height = max(self.text_font.metrics("linespace") + TEXT_SPACING_TOP + TEXT_SPACING_BOTTOM, 1)
-        content_width = max(width - (TEXT_PAD_X * 2), 120)
-        content_height = max(height - (TEXT_PAD_Y * 2), 60)
-        chars_per_line = max((content_width // char_width) - 1, 6)
-        lines_per_page = max((content_height // line_height) - PAGE_BOTTOM_GUARD_LINES, 3)
+        content_width = max(width - (TEXT_PAD_X * 2), 1)
+        content_height = max(height - (TEXT_PAD_Y * 2), 1)
+        lines_per_page = max(content_height // line_height, 1)
 
         pages: list[str] = []
         raw_line_ranges: list[tuple[int, int]] = []
+        source_offsets: list[int] = []
         current_lines: list[str] = []
         page_start_raw_line = 1
         current_page_raw_lines: set[int] = set()
@@ -342,19 +378,27 @@ class NovelOverlayApp:
             current_page_raw_lines = set()
             page_start_raw_line = next_start_raw_line
 
-        for raw_line_no, raw_line in enumerate(self.loaded_text.splitlines(), start=1):
+        raw_offset = 0
+        for raw_line_no, source_line in enumerate(self.loaded_text.splitlines(keepends=True), start=1):
+            split_line = source_line.splitlines()
+            raw_line = split_line[0] if split_line else ""
             if is_chapter_title(raw_line) and current_lines:
                 flush_page(raw_line_no)
 
-            wrapped_lines = wrap_display_line(raw_line, chars_per_line)
+            wrapped_lines = wrap_display_line(raw_line, content_width, measure)
 
+            column = 0
             for wrapped_index, line in enumerate(wrapped_lines):
+                if not current_lines:
+                    source_offsets.append(raw_offset + column)
                 current_lines.append(line)
+                column += len(line)
                 current_page_raw_lines.add(raw_line_no)
                 if len(current_lines) >= lines_per_page:
                     has_more_wrapped_lines = wrapped_index < len(wrapped_lines) - 1
                     next_start_raw_line = raw_line_no if has_more_wrapped_lines else raw_line_no + 1
                     flush_page(next_start_raw_line)
+            raw_offset += len(source_line)
 
         if current_lines:
             flush_page(page_start_raw_line)
@@ -362,9 +406,11 @@ class NovelOverlayApp:
         if not pages:
             pages = [""]
             raw_line_ranges = [(1, 1)]
+            source_offsets = [0]
 
         self.pages = pages
         self.page_raw_line_ranges = raw_line_ranges
+        self.page_source_offsets = source_offsets
         self.current_page = min(self.current_page, len(self.pages) - 1)
 
     def show_page(self, page_index: int) -> None:
@@ -374,10 +420,16 @@ class NovelOverlayApp:
         self.current_page = min(max(page_index, 0), len(self.pages) - 1)
         self.text_widget.configure(state="normal")
         self.text_widget.delete("1.0", "end")
-        self.text_widget.insert("1.0", self.pages[self.current_page])
+        self.text_widget.insert("1.0", self.pages[self.current_page].replace("\t", "    "))
         self.text_widget.configure(state="disabled")
+        self.text_widget.xview_moveto(0)
+        self.text_widget.yview_moveto(0)
 
     def restore_progress(self, entry: dict) -> None:
+        offset = entry.get("source_offset")
+        if isinstance(offset, int):
+            self.show_page(self.find_page_for_offset(offset))
+            return
         page_start = entry.get("page_start")
         if isinstance(page_start, int):
             self.show_page(self.find_page_for_raw_line(page_start))
@@ -398,6 +450,7 @@ class NovelOverlayApp:
         entry = self.ensure_book_entry(self.file_path)
         entry["page"] = self.current_page
         entry["page_start"] = self.current_page_start_line()
+        entry["source_offset"] = self.current_page_offset()
         entry.pop("page_preview", None)
         entry.pop("progress", None)
         self.state["last_book"] = str(self.file_path)
@@ -412,10 +465,19 @@ class NovelOverlayApp:
         self.schedule_state_save()
         return "break"
 
-    def handle_mousewheel(self, event: tk.Event) -> str:
-        if getattr(event, "delta", 0) > 0 or getattr(event, "num", None) == 4:
+    def handle_direction_key(self, direction: str, source: str) -> str:
+        # The global listener is the sole paging source, regardless of focus.
+        if source == "local":
+            return "break"
+
+        if direction == "left":
             return self.previous_page()
-        return self.next_page()
+        if direction == "right":
+            return self.next_page()
+        return "break"
+
+    def handle_mousewheel(self, event: tk.Event) -> str:
+        return "break"
 
     def start_drag(self, event: tk.Event) -> str:
         self.drag_origin_x = event.x_root
@@ -477,16 +539,24 @@ class NovelOverlayApp:
         self.text_widget.configure(cursor="arrow")
 
     def handle_configure(self, _event: tk.Event) -> None:
+        self.update_reader_bounds()
         current_signature = (
-            max(self.text_widget.winfo_width(), DEFAULT_WIDTH),
-            max(self.text_widget.winfo_height(), DEFAULT_HEIGHT),
+            self.text_widget.winfo_width(),
+            self.text_widget.winfo_height(),
             int(self.text_font.cget("size")),
         )
         if current_signature != self.last_layout_signature and self.loaded_text:
-            previous_line = self.current_page_start_line()
+            previous_offset = self.current_page_offset()
             self.repaginate_content()
-            self.show_page(self.find_page_for_raw_line(previous_line))
+            self.show_page(self.find_page_for_offset(previous_offset))
         self.schedule_state_save()
+
+    def update_reader_bounds(self) -> None:
+        left, top = self.root.winfo_rootx(), self.root.winfo_rooty()
+        right, bottom = left + self.root.winfo_width(), top + self.root.winfo_height()
+        # pynput reports physical screen pixels; Tk uses DPI-virtualized pixels.
+        self.reader_bounds = (*convert_screen_point(self.root, left, top, to_physical=True),
+                              *convert_screen_point(self.root, right, bottom, to_physical=True))
 
     def adjust_font(self, delta: int) -> None:
         current_size = int(self.text_font.cget("size"))
@@ -495,24 +565,57 @@ class NovelOverlayApp:
             return
         self.text_font.configure(size=new_size)
         if self.loaded_text:
-            previous_line = self.current_page_start_line()
+            previous_offset = self.current_page_offset()
             self.repaginate_content()
-            self.show_page(self.find_page_for_raw_line(previous_line))
+            self.show_page(self.find_page_for_offset(previous_offset))
         self.schedule_state_save()
 
     def install_global_listeners(self) -> None:
         self.hotkey_listener = keyboard.GlobalHotKeys({SHOW_HOTKEY: lambda: self.input_events.put(("show",))})
         self.hotkey_listener.start()
-        self.mouse_listener = mouse.Listener(on_click=self.on_global_click, on_scroll=self.on_global_scroll)
+        self.keyboard_listener = keyboard.Listener(on_press=self.on_global_key_press, suppress=False)
+        self.keyboard_listener.start()
+        self.mouse_listener = mouse.Listener(
+            on_click=self.on_global_click,
+            on_scroll=self.on_global_scroll,
+            win32_event_filter=self.filter_mouse_event,
+        )
         self.mouse_listener.start()
+
+    def filter_mouse_event(self, msg: int, data) -> None:
+        # No Tk calls on the hook thread. Capture the entire right-button pair
+        # so transparent pixels cannot open a menu in the application beneath.
+        if msg == 0x0205 and self.right_click_captured is not None:  # WM_RBUTTONUP
+            position = self.right_click_captured
+            self.right_click_captured = None
+            self.input_events.put(("context_menu", *position))
+            self.mouse_listener.suppress_event()
+        if msg != 0x0204:  # WM_RBUTTONDOWN
+            return
+        bounds = self.reader_bounds
+        if (self.closed or not self.visible or self.context_menu_active
+                or self.child_windows or bounds is None):
+            return
+        left, top, right, bottom = bounds
+        if left <= data.pt.x < right and top <= data.pt.y < bottom:
+            self.right_click_captured = (data.pt.x, data.pt.y)
+            self.mouse_listener.suppress_event()
+
+    def on_global_key_press(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
+        if self.closed:
+            return
+        if key == keyboard.Key.left:
+            self.input_events.put(("key", "left"))
+        elif key == keyboard.Key.right:
+            self.input_events.put(("key", "right"))
 
     def on_global_click(self, x_pos: int, y_pos: int, _button: mouse.Button, pressed: bool) -> None:
         if not pressed or self.closed:
             return
-        self.input_events.put(("click", x_pos, y_pos))
+        self.input_events.put(("click", x_pos, y_pos, time.monotonic()))
 
     def handle_global_click_on_ui_thread(self, x_pos: int, y_pos: int) -> None:
-        if not self.visible or self.context_menu_active:
+        if not self.visible or self.context_menu_active or self.has_open_child_window():
             return
         if self.is_point_inside_app(x_pos, y_pos):
             self.enter_reading_mode()
@@ -536,17 +639,31 @@ class NovelOverlayApp:
             kind = event[0]
             if kind == "show":
                 self.show_window()
-            elif kind == "click":
+            elif kind == "context_menu":
                 _, x_pos, y_pos = event
-                self.handle_global_click_on_ui_thread(x_pos, y_pos)
+                if self.visible and not self.context_menu_active and not self.has_open_child_window():
+                    self.popup_context_menu(*convert_screen_point(self.root, x_pos, y_pos, to_physical=False))
+                    if self.closed:
+                        return
+            elif kind == "click":
+                _, x_pos, y_pos, timestamp = event
+                if timestamp > self.ignore_clicks_before:
+                    self.handle_global_click_on_ui_thread(x_pos, y_pos)
             elif kind == "scroll":
                 _, dy = event
-                if self.visible and self.reading_mode:
+                if self.visible and self.reading_mode and not self.context_menu_active and not self.has_open_child_window():
                     if dy > 0:
                         self.previous_page()
                     else:
                         self.next_page()
+            elif kind == "key":
+                _, direction = event
+                if self.visible and self.reading_mode and not self.context_menu_active and not self.has_open_child_window():
+                    self.handle_direction_key(direction, "global")
         self.root.after(5, self.process_input_events)
+
+    def has_open_child_window(self) -> bool:
+        return any(window.winfo_exists() for window in self.child_windows)
 
     def is_point_inside_app(self, x_pos: int, y_pos: int) -> bool:
         for window in [self.root, *self.child_windows]:
@@ -556,18 +673,26 @@ class NovelOverlayApp:
             top = window.winfo_rooty()
             right = left + window.winfo_width()
             bottom = top + window.winfo_height()
-            if left <= x_pos <= right and top <= y_pos <= bottom:
+            left, top = convert_screen_point(window, left, top, to_physical=True)
+            right, bottom = convert_screen_point(window, right, bottom, to_physical=True)
+            if left <= x_pos < right and top <= y_pos < bottom:
                 return True
         return False
 
     def show_context_menu(self, event: tk.Event) -> str:
+        self.popup_context_menu(event.x_root, event.y_root)
+        return "break"
+
+    def popup_context_menu(self, x_pos: int, y_pos: int) -> None:
         self.context_menu_active = True
         try:
-            self.menu.tk_popup(event.x_root, event.y_root)
+            self.root.focus_force()
+            self.menu.tk_popup(x_pos, y_pos)
         finally:
-            self.menu.grab_release()
-            self.root.after(120, self.clear_context_menu_state)
-        return "break"
+            self.ignore_clicks_before = time.monotonic()
+            if not self.closed:
+                self.menu.grab_release()
+                self.root.after(120, self.clear_context_menu_state)
 
     def clear_context_menu_state(self) -> None:
         self.context_menu_active = False
@@ -708,6 +833,14 @@ class NovelOverlayApp:
         page_index = min(max(self.current_page, 0), len(self.page_raw_line_ranges) - 1)
         return self.page_raw_line_ranges[page_index][0]
 
+    def current_page_offset(self) -> int:
+        if not self.page_source_offsets:
+            return 0
+        return self.page_source_offsets[min(self.current_page, len(self.page_source_offsets) - 1)]
+
+    def find_page_for_offset(self, offset: int) -> int:
+        return max(0, bisect_right(self.page_source_offsets, offset) - 1)
+
     def register_child_window(self, window: tk.Toplevel) -> None:
         self.child_windows.append(window)
         window.protocol("WM_DELETE_WINDOW", lambda win=window: self.close_child_window(win))
@@ -756,6 +889,9 @@ class NovelOverlayApp:
         if self.hotkey_listener is not None:
             self.hotkey_listener.stop()
             self.hotkey_listener = None
+        if self.keyboard_listener is not None:
+            self.keyboard_listener.stop()
+            self.keyboard_listener = None
         for child in list(self.child_windows):
             self.close_child_window(child)
         self.root.destroy()
